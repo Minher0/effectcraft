@@ -277,6 +277,14 @@ impl EffectHost for FxHost<'_, '_, '_> {
             return None;
         }
         let sub = self.r.nested();
+        // A 3D model or primitive layer has no 2D source of its own: an effect referencing one
+        // reads it as After Effects does — the layer rendered on its own through the comp's
+        // camera (Create 3D Layer Instance's CC Composite), in the layer's effect space (the
+        // comp, centred on the layer's anchor).
+        if other.source.is_model() {
+            let buf = sub.solo_3d(self.ctx, other);
+            return Some(self.pixels(other, buf, false));
+        }
         // The cached layer buffer is shared; effects get their own copy.
         let buf = if masks_and_effects { (*sub.content_buf(self.ctx, other)?).clone() } else { sub.source(self.ctx, other)? };
         Some(self.pixels(other, buf, true))
@@ -1491,6 +1499,30 @@ impl<'a> Renderer<'a> {
     /// without pixels.
     pub fn layer_source(&self, ctx: &EvalCtx, layer: &Layer) -> Option<Buf> {
         self.source(ctx, layer)
+    }
+
+    /// A 3D model or primitive layer rendered on its own, through the comp's camera: what an
+    /// effect layer parameter reads when it references one, as After Effects, which renders 3D
+    /// layers through the active camera. The comp's pixels at this render's scale; the layer's
+    /// blend mode, track matte and video switch don't apply (a source read, not a composite —
+    /// the solo clone of a 3D track matte, see `three_d::adv`).
+    fn solo_3d(&self, ctx: &EvalCtx, layer: &Layer) -> Buf {
+        let s = self.opts.scale;
+        let w = ((ctx.comp.width as f64 * s).ceil() as u32).max(1);
+        let h = ((ctx.comp.height as f64 * s).ceil() as u32).max(1);
+        let mut canvas = Image::new(w, h);
+        // Outside the layer's in/out points there is nothing to read: the copy is transparent
+        // there, like any other layer reference (the 3D pipelines don't gate on the range).
+        if !layer.is_active_at(ctx.time) {
+            return Buf { img: canvas, offset: [0.0; 2], scale: s };
+        }
+        let mut solo = layer.clone();
+        solo.track_matte = None;
+        solo.blend_mode = effectcraft_color::BlendMode::Normal;
+        solo.preserve_transparency = false;
+        solo.switches.video = true;
+        three_d::compose::draw_run(self, ctx, &[&solo], &mut canvas);
+        Buf { img: canvas, offset: [0.0; 2], scale: s }
     }
 
     /// Layer pixels after source → masks → effects (no layer styles).
