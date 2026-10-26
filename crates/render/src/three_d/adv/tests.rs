@@ -2,7 +2,7 @@ use effectcraft_keyframe::Value;
 use effectcraft_project::{Comp, ItemId, ItemKind, LayerSource, LightKind, PrimitiveKind, Project, Renderer as R3, build};
 use effectcraft_time::{FrameRate, Tick};
 
-use super::scene::{Material, Scene, TexInfo, Vertex, irradiance_map};
+use super::scene::{Material, Scene, TexInfo, Vertex, dominant_direction, irradiance_map};
 use super::shade::{self, PI};
 use super::*;
 use crate::{NoFootage, RenderOpts, Renderer};
@@ -65,6 +65,17 @@ fn constant_environment_has_constant_irradiance() {
     let sky: Vec<[f32; 4]> = (0..32).flat_map(|y| (0..64).map(move |_| if y < 16 { [1.0, 1.0, 1.0, 1.0] } else { [0.0, 0.0, 0.0, 1.0] })).collect();
     let irr = irradiance_map(64, 32, &sky, 32, 16);
     assert!(irr[16][0] > 0.9 && irr[15 * 32 + 16][0] < 0.1, "{:?} {:?}", irr[16], irr[15 * 32 + 16]);
+}
+
+/// A NaN or infinite texel poisons the sums (every NaN comparison is false, so the thresholds
+/// alone would pass it through as a NaN direction); an infinite one even where sin θ = 0 turns
+/// into NaN. Either way the sum is garbage, not a direction: no sun, so no shadow (#2436).
+#[test]
+fn a_non_finite_environment_has_no_sun_direction() {
+    let nan = vec![[f32::NAN; 4]; 8 * 4];
+    assert_eq!(dominant_direction(8, 4, &nan, 0.0), [0.0; 3]);
+    let inf = vec![[f32::INFINITY, 0.0, 0.0, 1.0]; 8 * 4];
+    assert_eq!(dominant_direction(8, 4, &inf, 0.0), [0.0; 3]);
 }
 
 #[test]
@@ -335,6 +346,130 @@ fn cards_and_environment_light() {
     assert!(c2[0] > 0.3, "{c2:?}");
     // The environment layer itself is not drawn.
     assert_eq!(lit.data[80 * 120 + 110][3], 0.0);
+}
+
+/// An Environment light with no Source and no Environment Layer lights the scene with a flat
+/// default environment of its colour × intensity — After Effects "uses a default environment
+/// map" for an Environment light — not nothing at all (#2436).
+#[test]
+fn environment_light_without_a_source_lights_the_scene() {
+    let (mut p, cid) = project(120, 90);
+    let sid = p.add_item(
+        "S",
+        Default::default(),
+        None,
+        ItemKind::Solid(effectcraft_project::Solid { color: [0.5, 0.5, 0.5], width: 60, height: 40, pixel_aspect: 1.0 }),
+    );
+    add(&mut p, cid, LayerSource::Solid { item: sid }, |l| l.switches.three_d = true);
+    let unlit = render(&p, cid);
+    let c = unlit.data[20 * 120 + 30];
+    assert!((c[0] - 0.5).abs() < 0.01 && c[3] > 0.99, "unlit card keeps its colour: {c:?}");
+    // No Source, no Environment Layer: the light still lights the card (a flat white
+    // environment at the light's colour × intensity; a card's Material Options shade it).
+    add(&mut p, cid, LayerSource::Light { kind: LightKind::Environment }, |_| {});
+    let lit = render(&p, cid);
+    let c2 = lit.data[20 * 120 + 30];
+    assert!((c2[0] - c[0]).abs() > 0.05 && c2[3] > 0.99, "the light has an effect: {c2:?} vs {c:?}");
+    // The light's parameters drive it: half intensity darkens towards zero intensity's black.
+    set(p.comp_mut(cid).unwrap().layers.first_mut().unwrap(), "lightOptions/intensity", Value::Scalar(50.0));
+    let half = render(&p, cid);
+    let c3 = half.data[20 * 120 + 30];
+    assert!(c3[0] < c2[0] - 0.02, "half intensity lights less: {c3:?} vs {c2:?}");
+    set(p.comp_mut(cid).unwrap().layers.first_mut().unwrap(), "lightOptions/intensity", Value::Scalar(0.0));
+    let dark = render(&p, cid);
+    let c4 = dark.data[20 * 120 + 30];
+    assert!(c4[0] < 0.02 && c4[3] > 0.99, "zero intensity lights nothing: {c4:?}");
+    // And its colour tints the light red.
+    set(p.comp_mut(cid).unwrap().layers.first_mut().unwrap(), "lightOptions/intensity", Value::Scalar(100.0));
+    set(p.comp_mut(cid).unwrap().layers.first_mut().unwrap(), "lightOptions/color", Value::Color([1.0, 0.0, 0.0, 1.0]));
+    let red = render(&p, cid);
+    let c5 = red.data[20 * 120 + 30];
+    assert!(c5[0] > 0.15 && c5[1] < 0.05 && c5[2] < 0.05, "red environment: {c5:?}");
+}
+
+/// #2436: an Environment light's Cast Shadows works like After Effects' — its image's dominant
+/// (brightest) region shadows the scene. A bright disc turned to shine from behind the camera
+/// (rotation 180°) shadows a sphere onto the plane behind it; Cast Shadows off lights it evenly.
+#[test]
+fn environment_lights_cast_shadows() {
+    let (mut p, cid) = project(200, 150);
+    // The floor facing the camera, a sphere in front of it casting shadows only.
+    add(&mut p, cid, LayerSource::Primitive { kind: PrimitiveKind::Plane }, |l| {
+        set(l, "geometryOptions/width", Value::Scalar(400.0));
+        set(l, "geometryOptions/height", Value::Scalar(400.0));
+        set(l, "transform/position", Value::Vec3([100.0, 75.0, 200.0]));
+        set(l, "materialOptions/baseColor", Value::Color([1.0, 1.0, 1.0, 1.0]));
+    });
+    add(&mut p, cid, LayerSource::Primitive { kind: PrimitiveKind::Sphere }, |l| {
+        set(l, "geometryOptions/radius", Value::Scalar(30.0));
+        set(l, "transform/position", Value::Vec3([100.0, 75.0, 50.0]));
+        set(l, "materialOptions/castsShadows", Value::Enum(2));
+    });
+    // The Environment Layer: a bright disc at the image's centre on black.
+    add(&mut p, cid, LayerSource::Shape, |l| {
+        l.switches.three_d = true;
+        let mut next = 10_000u64;
+        let ids = &mut build::Ids(&mut next);
+        let rect = build::shape_rect(ids, [200.0, 150.0], [0.0, 0.0], 0.0);
+        let gfill = build::shape_gradient_fill(
+            ids,
+            true,
+            [0.0, 0.0],
+            [0.0, 75.0],
+            effectcraft_keyframe::Gradient { colors: vec![(0.0, [1.0, 1.0, 1.0, 1.0]), (1.0, [0.0, 0.0, 0.0, 1.0])], opacities: vec![(0.0, 1.0), (1.0, 1.0)] },
+        );
+        let g = build::shape_group(ids, "Sky", vec![rect, gfill]);
+        l.props.sub_mut("contents").unwrap().children.push(g.into());
+        l.environment = true;
+    });
+    // Turned 180°, the disc shines from behind the camera, straight at the floor.
+    add(&mut p, cid, LayerSource::Light { kind: LightKind::Environment }, |l| {
+        set(l, "lightOptions/rotation", Value::Scalar(180.0));
+        set(l, "lightOptions/castsShadows", Value::Bool(true));
+    });
+    let img = render(&p, cid);
+    let (mid, side) = (img.data[75 * 200 + 100], img.data[75 * 200 + 20]);
+    assert!(mid[3] > 0.99 && side[3] > 0.99);
+    assert!(mid[0] < side[0] * 0.5, "the disc shadows the sphere onto the floor: {mid:?} vs {side:?}");
+    // Cast Shadows off: the floor is lit everywhere.
+    let comp = p.comp_mut(cid).unwrap();
+    set(&mut comp.layers[0], "lightOptions/castsShadows", Value::Bool(false));
+    let img = render(&p, cid);
+    let mid = img.data[75 * 200 + 100];
+    assert!(mid[0] > side[0] * 0.8, "no shadow without Cast Shadows: {mid:?} vs {side:?}");
+}
+
+/// #2436: a uniform environment has no dominant region, so even with Cast Shadows on it casts
+/// nothing — the render is the same as with the option off.
+#[test]
+fn a_uniform_environment_casts_no_shadow() {
+    let (mut p, cid) = project(120, 90);
+    let card = p.add_item(
+        "S",
+        Default::default(),
+        None,
+        ItemKind::Solid(effectcraft_project::Solid { color: [1.0, 1.0, 1.0], width: 60, height: 40, pixel_aspect: 1.0 }),
+    );
+    add(&mut p, cid, LayerSource::Solid { item: card }, |l| l.switches.three_d = true);
+    let env = p.add_item(
+        "E",
+        Default::default(),
+        None,
+        ItemKind::Solid(effectcraft_project::Solid { color: [1.0, 1.0, 1.0], width: 64, height: 32, pixel_aspect: 1.0 }),
+    );
+    add(&mut p, cid, LayerSource::Solid { item: env }, |l| {
+        l.environment = true;
+        l.switches.three_d = true;
+    });
+    add(&mut p, cid, LayerSource::Light { kind: LightKind::Environment }, |l| {
+        set(l, "lightOptions/castsShadows", Value::Bool(true));
+    });
+    let casting = render(&p, cid);
+    let comp = p.comp_mut(cid).unwrap();
+    set(&mut comp.layers[0], "lightOptions/castsShadows", Value::Bool(false));
+    let off = render(&p, cid);
+    assert!(casting.data[20 * 120 + 30][0] > 0.3, "the card is lit");
+    assert_eq!(casting.data, off.data, "a directionless image casts no shadow");
 }
 
 #[test]
